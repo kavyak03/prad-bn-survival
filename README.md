@@ -1,6 +1,3 @@
-# prad-bn-survival
-Bayesian network model for survival prediction in prostate cancer patients
-
 # PRAD Causal Bayesian Survival
 
 Implementation of an interpretable, probabilistic pipeline inspired by TCGA-PRAD:
@@ -24,13 +21,13 @@ source .venv/bin/activate  # mac/linux
 pip install -r requirements.txt
 ```
 
-### 2) Run the full toy pipeline
+### 2) Run the full pipeline
 ```bash
 python scripts/run_pipeline.py --outdir runs/demo --seed 7
 ```
 
-This will (example data can be substituted with data of your choice in the same format):
-- generate data
+This will:
+- generate data  (simulated data can be substituted with data of your choice in the same format)
 - run the iterative BN loop
 - print AUC
 - save plots + artifacts to `runs/demo`
