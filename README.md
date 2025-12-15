@@ -1,4 +1,4 @@
-# PRAD Causal Bayesian Survival
+# Bayesian netowrk model for predicting survival in prostate cancer patients
 
 Implementation of an interpretable, probabilistic pipeline inspired by TCGA-PRAD:
 - **Simulate** PRAD-like gene expression (right-skewed, block-correlated modules)
