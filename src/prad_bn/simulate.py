@@ -93,26 +93,26 @@ def simulate_survival(cfg: SimConfig, rng: np.random.Generator) -> tuple[np.ndar
     return time_days, event_observed
 
 
-def inject_survival_signal(
-    expr: np.ndarray,
-    risk_groups: np.ndarray,
-    cfg: SimConfig,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
+def inject_survival_signal(expr: np.ndarray, km_group: np.ndarray, cfg: SimConfig, rng: np.random.Generator):
     """
-    Inject weak outcome-associated signal into a small set of genes.
+    Inject survival-associated signal into a subset of genes.
 
-    Idea: add a small shift proportional to risk group label.
+    We shift expression *monotonically* with risk group so discretization preserves the signal.
     """
+    expr = expr.copy()
     n_samples, n_genes = expr.shape
-    genes = rng.choice(n_genes, size=cfg.signal_genes, replace=False)
-
-    expr2 = expr.copy()
-    for g in genes:
-        expr2[:, g] = np.clip(expr2[:, g] + (risk_groups * cfg.signal_strength), 0.0, cfg.expr_scale)
-
-    return expr2, genes
-
+    n_signal = int(getattr(cfg, 'signal_genes', 6))
+    strength = float(getattr(cfg, 'signal_strength', 2.0))
+    signal_genes = rng.choice(n_genes, size=min(n_signal, n_genes), replace=False)
+    # Normalize group to [0,1] so the shift is smooth
+    g = km_group.astype(float)
+    if g.max() > 0:
+        g = g / g.max()
+    # Apply shift: higher risk -> higher expression in signal genes
+    shift = strength * (g - g.mean())
+    for sg in signal_genes:
+        expr[:, sg] = expr[:, sg] + shift + rng.normal(0, 0.05, size=n_samples)
+    return expr, signal_genes
 
 def simulate_prad_like_dataset(cfg: SimConfig, seed: int = 7) -> dict:
     """

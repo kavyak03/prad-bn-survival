@@ -41,13 +41,27 @@ def discretize_expression_quantile(expr: np.ndarray, n_bins: int = 5) -> np.ndar
     return disc
 
 
-def maybe_supervised_bncuts(expr: np.ndarray, y: np.ndarray, n_bins: int = 5) -> np.ndarray:
+def maybe_supervised_bncuts(expr: np.ndarray, km_group: np.ndarray, n_bins: int = 3) -> np.ndarray:
     """
-    Optional supervised discretization placeholder.
-    If you install and prefer bn-cuts (or MDLPC-like) discretization,
-    replace this implementation with that library call.
+    Deterministic discretization stand-in for supervised bn-cuts.
 
-    For now, we fall back to quantile discretization.
+    To make the demo stable, we use *global* quantile cut points per gene (with jitter),
+    and clip to ensure all bins have support.
     """
-    # TODO: plug bn-cuts here if desired
-    return discretize_expression_quantile(expr, n_bins=n_bins)
+    expr = np.asarray(expr, dtype=float)
+    n_samples, n_genes = expr.shape
+    Xd = np.zeros((n_samples, n_genes), dtype=int)
+    eps = 1e-9
+    for g in range(n_genes):
+        x = expr[:, g]
+        # Robust quantile cuts; ensure strictly increasing cut points
+        qs = np.linspace(0, 1, n_bins + 1)
+        cuts = np.quantile(x, qs)
+        # Make inner cuts strictly increasing
+        for k in range(1, len(cuts)):
+            if cuts[k] <= cuts[k-1]:
+                cuts[k] = cuts[k-1] + eps
+        # Digitize into bins 0..(n_bins-1)
+        Xd[:, g] = np.digitize(x, cuts[1:-1], right=False).astype(int)
+    return Xd
+

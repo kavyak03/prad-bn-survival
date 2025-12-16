@@ -1,121 +1,135 @@
+
 """
 Iterative Bayesian Network learning with AUC-driven feature sampling.
 
-Core loop:
-1) sample 15-20 genes using adaptive probabilities
-2) fit BN (genes + outcome) with constraints (max_parents)
-3) prune to nodes connected to outcome
-4) refit BN on pruned set
-5) infer posteriors and compute AUC
-6) update feature sampling probabilities based on performance feedback
-
-This is a toy. The goal is to demonstrate the concept clearly.
+Demo BN backend: Naive Bayes BN (Outcome -> genes) using pgmpy DiscreteBayesianNetwork.
+Core idea: feedback-driven adaptive feature sampling loop.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import List, Tuple
+
 import numpy as np
+import pandas as pd
 import networkx as nx
 
-from .bn_model import fit_bn_discrete, prune_to_outcome_connected, predict_outcome_posteriors
-from .evaluate import auc_group_vs_rest
+from pgmpy.models import DiscreteBayesianNetwork
+from pgmpy.estimators import BayesianEstimator
+from pgmpy.inference import VariableElimination
+
+from prad_bn.evaluate import auc_group4_vs_rest
 
 
 @dataclass
 class IterConfig:
     n_iters: int = 25
     subset_size: int = 20
-    max_parents: int = 3
     outcome_name: str = "Outcome"
-    target_group_for_auc: int = 0
-    lr: float = 0.25  # how aggressively to update sampling probs
 
 
 @dataclass
 class IterResult:
+    aucs: List[float]
     best_auc: float
-    best_features: list[int]
-    best_names: list[str]
-    history: list[dict]
+    best_features: List[int]
+    best_model_edges: List[Tuple[str, str]]
+    final_sampling_probs: np.ndarray
 
 
-def run_iterative_bn(
-    X_disc: np.ndarray,
-    y: np.ndarray,
-    seed: int = 7,
-    cfg: IterConfig = IterConfig(),
-) -> IterResult:
-    """
-    Args:
-      X_disc: (n_samples, n_genes) int
-      y: (n_samples,) int (0..K-1)
-    """
+def _naive_bayes_structure(columns: List[str], outcome: str) -> DiscreteBayesianNetwork:
+    gene_cols = [c for c in columns if c != outcome]
+    edges = [(outcome, g) for g in gene_cols]
+    model = DiscreteBayesianNetwork(edges)
+    model.add_nodes_from(columns)
+    return model
+
+
+def _prune_to_outcome_connected(model: DiscreteBayesianNetwork, outcome: str) -> DiscreteBayesianNetwork:
+    G = nx.Graph()
+    G.add_nodes_from(model.nodes())
+    G.add_edges_from(model.edges())
+    if outcome not in G:
+        return model
+    comp = nx.node_connected_component(G, outcome)
+    pruned_edges = [(u, v) for (u, v) in model.edges() if u in comp and v in comp]
+    pruned = DiscreteBayesianNetwork(pruned_edges)
+    pruned.add_nodes_from(list(comp))
+    return pruned
+
+
+def _infer_prob_worst(model: DiscreteBayesianNetwork, df: pd.DataFrame, outcome: str) -> np.ndarray:
+    infer = VariableElimination(model)
+    probs = np.zeros(df.shape[0], dtype=float)
+    worst = int(np.max(df[outcome].astype(int)))
+
+    for i, row in df.iterrows():
+        evidence = {col: int(row[col]) for col in df.columns if col != outcome}
+        try:
+            q = infer.query(variables=[outcome], evidence=evidence, show_progress=False)
+            probs[i] = float(q.values[worst]) if worst < len(q.values) else float(q.values[-1])
+        except Exception:
+            q = infer.query(variables=[outcome], show_progress=False)
+            probs[i] = float(q.values[-1])
+    return probs
+
+
+def run_iterative_bn(X_disc: np.ndarray, y: np.ndarray, cfg: IterConfig, seed: int = 7) -> IterResult:
     rng = np.random.default_rng(seed)
     n_samples, n_genes = X_disc.shape
 
-    # adaptive sampling probabilities over genes
     probs = np.ones(n_genes, dtype=float) / n_genes
 
-    best_auc = -1.0
-    best_features = []
-    best_names = []
-    history: list[dict] = []
-
-    # create combined data function
-    def make_data(feat_idx: np.ndarray) -> tuple[np.ndarray, list[str], int]:
-        names = [f"G{j}" for j in feat_idx] + [cfg.outcome_name]
-        outcome_idx = len(names) - 1
-        data = np.column_stack([X_disc[:, feat_idx], y])
-        return data, names, outcome_idx
+    best_auc = 0.0
+    best_features: List[int] = []
+    best_edges: List[Tuple[str, str]] = []
+    aucs: List[float] = []
+    failures = 0
 
     for t in range(cfg.n_iters):
-        feat_idx = rng.choice(n_genes, size=cfg.subset_size, replace=False, p=probs)
-        data, names, outcome_idx = make_data(feat_idx)
+        feat_idx = rng.choice(n_genes, size=min(cfg.subset_size, n_genes), replace=False, p=probs)
+        cols = [f"G{j}" for j in feat_idx] + [cfg.outcome_name]
+        data = np.column_stack([X_disc[:, feat_idx], y]).astype(int)
+        df = pd.DataFrame(data, columns=cols)
 
-        # fit BN on subset
-        fit = fit_bn_discrete(data, state_names=names, max_parents=cfg.max_parents, seed=int(seed + t))
+        try:
+            model = _naive_bayes_structure(cols, cfg.outcome_name)
+            model.fit(df, estimator=BayesianEstimator, prior_type='BDeu', equivalent_sample_size=5)
 
-        # prune to outcome-connected nodes (including outcome)
-        pruned_data, pruned_names = prune_to_outcome_connected(data, names, fit.graph, cfg.outcome_name)
+            model = _prune_to_outcome_connected(model, cfg.outcome_name)
+            df2 = df[list(model.nodes())]
+            model.fit(df2, estimator=BayesianEstimator, prior_type='BDeu', equivalent_sample_size=5)
 
-        # re-fit BN on pruned set (often smaller and more interpretable)
-        pruned_fit = fit_bn_discrete(
-            pruned_data,
-            state_names=pruned_names,
-            max_parents=cfg.max_parents,
-            seed=int(seed + 1000 + t),
-        )
+            p_worst = _infer_prob_worst(model, df2, cfg.outcome_name)
+            auc = auc_group4_vs_rest(y, p_worst)
+        except Exception:
+            failures += 1
+            auc = 0.5
+            model = None
 
-        # infer posteriors
-        out_idx2 = pruned_names.index(cfg.outcome_name)
-        posts = predict_outcome_posteriors(pruned_fit.model, pruned_data, outcome_idx=out_idx2)
+        aucs.append(float(auc))
 
-        # evaluate AUC (group vs rest)
-        auc = auc_group_vs_rest(y, posts, group=cfg.target_group_for_auc)
+        # Feedback update: reward above chance
+        reward = max(0.0, auc - 0.5)
+        if reward > 0:
+            probs[feat_idx] *= (1.0 + 15.0 * reward)
+            probs /= probs.sum()
+        else:
+            probs = 0.99 * probs + 0.01 * (np.ones_like(probs) / n_genes)
+            probs /= probs.sum()
 
-        # track best
-        improved = auc > best_auc
-        if improved:
+        if auc > best_auc:
             best_auc = auc
-            # map pruned gene names back to original indices
-            used_gene_names = [n for n in pruned_names if n != cfg.outcome_name]
-            used_gene_idx = [int(n[1:]) for n in used_gene_names]  # "G123" -> 123
-            best_features = used_gene_idx
-            best_names = pruned_names
+            best_features = feat_idx.tolist()
+            best_edges = list(model.edges()) if model is not None else []
 
-        # update sampling probabilities (simple bandit-like update)
-        # genes present in this iteration get a small reward if improved, else a small penalty
-        delta = cfg.lr * (1.0 if improved else -0.5)
-        probs[feat_idx] = np.clip(probs[feat_idx] * np.exp(delta), 1e-8, 1.0)
-        probs = probs / probs.sum()
+    if failures:
+        print(f"[iterative] Note: {failures}/{cfg.n_iters} iterations fell back to AUC=0.5 due to fit/inference issues")
 
-        history.append({
-            "iter": t,
-            "auc": float(auc),
-            "improved": bool(improved),
-            "subset_size": int(cfg.subset_size),
-            "pruned_vars": int(len(pruned_names)),
-            "kept_genes": int(len(pruned_names) - 1),
-        })
-
-    return IterResult(best_auc=best_auc, best_features=best_features, best_names=best_names, history=history)
+    return IterResult(
+        aucs=aucs,
+        best_auc=float(best_auc),
+        best_features=best_features,
+        best_model_edges=best_edges,
+        final_sampling_probs=probs,
+    )
