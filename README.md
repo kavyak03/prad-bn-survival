@@ -38,7 +38,7 @@ This will:
 - `scripts/run_pipeline.py` end-to-end runnable entrypoint
 - `runs/` outputs (created at runtime)
 
-## Typical interview talking points (mapped to the code)
+## Main concepts
 1. **Outcome engineering**: convert survival to 5 KM-like risk strata (`discretize.py`)
 2. **Simulation**: block-correlated genes + weak outcome signal (`simulate.py`)
 3. **Discretization**: bins for BN CPDs (`discretize.py`)
