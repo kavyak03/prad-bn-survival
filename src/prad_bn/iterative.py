@@ -27,6 +27,13 @@ class IterConfig:
     subset_size: int = 20
     outcome_name: str = "Outcome"
 
+    # Stabilized adaptive sampler knobs (prevent probability collapse)
+    temperature: float = 1.0     # higher = more exploration
+    epsilon: float = 0.05        # epsilon-greedy mixing with uniform
+    p_min: float = 1e-4          # probability floor
+    ema_alpha: float = 0.15      # smoothing for feature scores
+    reward_scale: float = 6.0    # how strongly AUC reward updates scores
+
 
 @dataclass
 class IterResult:
@@ -78,6 +85,8 @@ def run_iterative_bn(X_disc: np.ndarray, y: np.ndarray, cfg: IterConfig, seed: i
     rng = np.random.default_rng(seed)
     n_samples, n_genes = X_disc.shape
 
+    # Feature scores updated via EMA; probabilities derived from softmax(scores/temperature)
+    scores = np.zeros(n_genes, dtype=float)
     probs = np.ones(n_genes, dtype=float) / n_genes
 
     best_auc = 0.0
@@ -108,15 +117,29 @@ def run_iterative_bn(X_disc: np.ndarray, y: np.ndarray, cfg: IterConfig, seed: i
             model = None
 
         aucs.append(float(auc))
+        # Feedback update (stabilized): update scores, then softmax + epsilon-greedy + floor
+        reward = float(auc - 0.5)
+        # small negative rewards shouldn't collapse; clip
+        reward = max(-0.05, min(0.30, reward))
+        # delta for sampled features
+        delta = np.zeros(n_genes, dtype=float)
+        delta[feat_idx] = reward
+        scores = (1.0 - cfg.ema_alpha) * scores + cfg.ema_alpha * (cfg.reward_scale * delta)
 
-        # Feedback update: reward above chance
-        reward = max(0.0, auc - 0.5)
-        if reward > 0:
-            probs[feat_idx] *= (1.0 + 15.0 * reward)
-            probs /= probs.sum()
-        else:
-            probs = 0.99 * probs + 0.01 * (np.ones_like(probs) / n_genes)
-            probs /= probs.sum()
+        # Softmax with temperature
+        T = max(1e-6, float(cfg.temperature))
+        s = scores / T
+        s = s - np.max(s)
+        p = np.exp(s)
+        p = p / np.sum(p)
+
+        # Mix with uniform for exploration
+        eps = float(cfg.epsilon)
+        p = (1.0 - eps) * p + eps * (np.ones_like(p) / n_genes)
+
+        # Probability floor
+        p = np.maximum(p, float(cfg.p_min))
+        probs = p / np.sum(p)
 
         if auc > best_auc:
             best_auc = auc

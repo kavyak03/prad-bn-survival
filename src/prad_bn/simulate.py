@@ -24,6 +24,10 @@ class SimConfig:
     signal_strength: float = 0.8
     censoring_rate: float = 0.35
     survival_scale_days: float = 1000.0
+    use_expr_survival: bool = True
+    n_signal_blocks: int = 3          # number of correlated blocks that affect survival
+    block_signal_genes: int = 6       # genes per signal block
+    survival_beta: float = 0.6        # effect size on log-hazard
 
 
 def _make_block_cov(n_genes: int, n_blocks: int, block_corr: float) -> np.ndarray:
@@ -92,6 +96,60 @@ def simulate_survival(cfg: SimConfig, rng: np.random.Generator) -> tuple[np.ndar
     time_days = np.where(event_observed == 0, time_days * censor_factor, time_days)
     return time_days, event_observed
 
+def simulate_survival_from_expression(expr: np.ndarray, cfg: SimConfig, rng: np.random.Generator):
+    """Simulate survival where risk is driven by *distributed, block-level* gene programs.
+
+    This avoids a 'single magic gene' and better matches real tumor biology where pathways matter.
+    Mechanism:
+    - Pick several blocks
+    - Within each, pick a few genes
+    - Compute a latent risk score as the mean expression of those genes (standardized)
+    - Generate time-to-event with hazard scaled by exp(beta * risk)
+
+    Returns:
+      time_days, event_observed, signal_gene_indices
+    """
+    n_samples, n_genes = expr.shape
+    n_blocks = int(max(1, cfg.n_blocks))
+    # Build block index ranges (same partitioning as _make_block_cov)
+    sizes = [n_genes // n_blocks] * n_blocks
+    for i in range(n_genes % n_blocks):
+        sizes[i] += 1
+    ranges=[]
+    s=0
+    for bsz in sizes:
+        ranges.append((s, s+bsz))
+        s += bsz
+
+    n_sig_blocks = int(min(cfg.n_signal_blocks, n_blocks))
+    chosen_blocks = rng.choice(n_blocks, size=n_sig_blocks, replace=False)
+
+    sig_genes=[]
+    for b in chosen_blocks:
+        start,end = ranges[b]
+        k = int(min(cfg.block_signal_genes, end-start))
+        if k <= 0:
+            continue
+        sig = rng.choice(np.arange(start,end), size=k, replace=False)
+        sig_genes.extend(list(sig))
+    sig_genes = np.array(sorted(set(sig_genes)), dtype=int)
+
+    # latent risk: mean of signal genes, standardized
+    risk = expr[:, sig_genes].mean(axis=1) if len(sig_genes) else expr.mean(axis=1)
+    risk = (risk - risk.mean()) / (risk.std() + 1e-8)
+
+    # time-to-event: exponential with hazard scaled by exp(beta*risk)
+    base_scale = float(cfg.survival_scale_days)
+    beta = float(cfg.survival_beta)
+    # shorter times for higher risk
+    scale = base_scale / np.exp(beta * risk)
+    time_days = rng.exponential(scale=scale)
+
+    event_observed = (rng.random(n_samples) > cfg.censoring_rate).astype(int)
+    censor_factor = rng.uniform(0.4, 1.0, size=n_samples)
+    time_days = np.where(event_observed == 0, time_days * censor_factor, time_days)
+    return time_days, event_observed, sig_genes
+
 
 def inject_survival_signal(expr: np.ndarray, km_group: np.ndarray, cfg: SimConfig, rng: np.random.Generator):
     """
@@ -122,7 +180,12 @@ def simulate_prad_like_dataset(cfg: SimConfig, seed: int = 7) -> dict:
     rng = np.random.default_rng(seed)
 
     expr = simulate_expression(cfg, rng)
-    time_days, event = simulate_survival(cfg, rng)
+
+    if getattr(cfg, 'use_expr_survival', False):
+        time_days, event, signal_genes_survival = simulate_survival_from_expression(expr, cfg, rng)
+    else:
+        time_days, event = simulate_survival(cfg, rng)
+        signal_genes_survival = np.array([], dtype=int)
 
     # risk groups will be computed downstream using quantile binning
     # (we return time_days for that)
@@ -130,4 +193,6 @@ def simulate_prad_like_dataset(cfg: SimConfig, seed: int = 7) -> dict:
         "expr": expr,
         "time_days": time_days,
         "event": event,
+        "signal_genes_survival": signal_genes_survival,
     }
+
