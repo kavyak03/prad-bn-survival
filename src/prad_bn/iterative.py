@@ -8,7 +8,7 @@ Core idea: feedback-driven adaptive feature sampling loop.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -34,6 +34,10 @@ class IterConfig:
     ema_alpha: float = 0.15      # smoothing for feature scores
     reward_scale: float = 6.0    # how strongly AUC reward updates scores
 
+    # BN parameter smoothing
+    prior_type: str = "BDeu"
+    equivalent_sample_size: int = 5
+
 
 @dataclass
 class IterResult:
@@ -44,9 +48,26 @@ class IterResult:
     final_sampling_probs: np.ndarray
 
 
-def _naive_bayes_structure(columns: List[str], outcome: str) -> DiscreteBayesianNetwork:
-    gene_cols = [c for c in columns if c != outcome]
-    edges = [(outcome, g) for g in gene_cols]
+def _naive_bayes_structure(
+    columns: List[str],
+    outcome: str,
+    covariate_cols: Optional[List[str]] = None,
+) -> DiscreteBayesianNetwork:
+    """Create a simple BN structure.
+
+    Default demo structure is Naive Bayes: Outcome -> genes.
+
+    If covariates are provided, treat them as *confounders* for outcome by adding:
+      covariate -> Outcome
+    while keeping:
+      Outcome -> genes
+
+    This makes the BN prediction for Outcome condition on both genes and covariates.
+    """
+    covariate_cols = covariate_cols or []
+    cov_set = set(covariate_cols)
+    gene_cols = [c for c in columns if c != outcome and c not in cov_set]
+    edges = [(outcome, g) for g in gene_cols] + [(z, outcome) for z in covariate_cols]
     model = DiscreteBayesianNetwork(edges)
     model.add_nodes_from(columns)
     return model
@@ -81,7 +102,14 @@ def _infer_prob_worst(model: DiscreteBayesianNetwork, df: pd.DataFrame, outcome:
     return probs
 
 
-def run_iterative_bn(X_disc: np.ndarray, y: np.ndarray, cfg: IterConfig, seed: int = 7) -> IterResult:
+def run_iterative_bn(
+    X_disc: np.ndarray,
+    y: np.ndarray,
+    cfg: IterConfig,
+    seed: int = 7,
+    Z_disc: Optional[np.ndarray] = None,
+    z_names: Optional[List[str]] = None,
+) -> IterResult:
     rng = np.random.default_rng(seed)
     n_samples, n_genes = X_disc.shape
 
@@ -95,19 +123,41 @@ def run_iterative_bn(X_disc: np.ndarray, y: np.ndarray, cfg: IterConfig, seed: i
     aucs: List[float] = []
     failures = 0
 
+    if Z_disc is not None and Z_disc.shape[0] != n_samples:
+        raise ValueError(f"Z_disc must have same number of rows as X_disc (got {Z_disc.shape[0]} vs {n_samples})")
+    z_names = z_names or ([f"Z{i}" for i in range(Z_disc.shape[1])] if Z_disc is not None else [])
+
     for t in range(cfg.n_iters):
         feat_idx = rng.choice(n_genes, size=min(cfg.subset_size, n_genes), replace=False, p=probs)
-        cols = [f"G{j}" for j in feat_idx] + [cfg.outcome_name]
-        data = np.column_stack([X_disc[:, feat_idx], y]).astype(int)
+        gene_cols = [f"G{j}" for j in feat_idx]
+        cov_cols = list(z_names) if Z_disc is not None else []
+        cols = gene_cols + cov_cols + [cfg.outcome_name]
+
+        blocks = [X_disc[:, feat_idx]]
+        if Z_disc is not None:
+            blocks.append(Z_disc)
+        blocks.append(y.reshape(-1, 1))
+
+        data = np.column_stack(blocks).astype(int)
         df = pd.DataFrame(data, columns=cols)
 
         try:
-            model = _naive_bayes_structure(cols, cfg.outcome_name)
-            model.fit(df, estimator=BayesianEstimator, prior_type='BDeu', equivalent_sample_size=5)
+            model = _naive_bayes_structure(cols, cfg.outcome_name, covariate_cols=cov_cols)
+            model.fit(
+                df,
+                estimator=BayesianEstimator,
+                prior_type=str(cfg.prior_type),
+                equivalent_sample_size=int(cfg.equivalent_sample_size),
+            )
 
             model = _prune_to_outcome_connected(model, cfg.outcome_name)
             df2 = df[list(model.nodes())]
-            model.fit(df2, estimator=BayesianEstimator, prior_type='BDeu', equivalent_sample_size=5)
+            model.fit(
+                df2,
+                estimator=BayesianEstimator,
+                prior_type=str(cfg.prior_type),
+                equivalent_sample_size=int(cfg.equivalent_sample_size),
+            )
 
             p_worst = _infer_prob_worst(model, df2, cfg.outcome_name)
             auc = auc_group4_vs_rest(y, p_worst)

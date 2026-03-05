@@ -196,3 +196,74 @@ def simulate_prad_like_dataset(cfg: SimConfig, seed: int = 7) -> dict:
         "signal_genes_survival": signal_genes_survival,
     }
 
+
+def simulate_clinical_covariates(
+    n_samples: int,
+    rng: np.random.Generator,
+    *,
+    age_mean: float = 65.0,
+    age_sd: float = 8.0,
+) -> dict:
+    """Simulate simple PRAD-like clinical covariates.
+
+    Returns a dict with keys: age, stage, gleason.
+
+    Notes:
+    - This is intentionally simple and interview-demo friendly.
+    - Stage is categorical {I, II, III, IV}.
+    - Gleason is correlated with stage.
+    """
+    age = rng.normal(loc=age_mean, scale=age_sd, size=n_samples)
+    age = np.clip(age, 40.0, 90.0)
+
+    stage_levels = np.array(["I", "II", "III", "IV"], dtype=object)
+    stage = rng.choice(stage_levels, size=n_samples, p=[0.25, 0.45, 0.22, 0.08])
+
+    # Gleason loosely correlated with stage
+    stage_to_base = {"I": 6.0, "II": 7.0, "III": 8.0, "IV": 9.0}
+    base = np.array([stage_to_base[s] for s in stage], dtype=float)
+    gleason = base + rng.normal(0.0, 0.6, size=n_samples)
+    gleason = np.clip(np.round(gleason), 6.0, 10.0)
+
+    return {"age": age, "stage": stage, "gleason": gleason}
+
+
+def apply_covariate_confounding_to_survival(
+    time_days: np.ndarray,
+    covariates: dict,
+    rng: np.random.Generator,
+    *,
+    gamma_age: float = 0.25,
+    gamma_stage: float = 0.35,
+    gamma_gleason: float = 0.25,
+) -> np.ndarray:
+    """Optionally make survival depend on clinical covariates.
+
+    This simulates confounding: clinical covariates affect outcome, and may also be
+    correlated with expression in real data.
+
+    Mechanism:
+      time' = time / exp(gamma * risk(covariates))
+    So higher age/stage/gleason => shorter survival.
+    """
+    t = np.asarray(time_days, dtype=float).copy()
+
+    age = np.asarray(covariates.get("age"), dtype=float)
+    gleason = np.asarray(covariates.get("gleason"), dtype=float)
+    stage = np.asarray(covariates.get("stage"), dtype=object)
+
+    age_z = (age - np.nanmean(age)) / (np.nanstd(age) + 1e-8)
+    gl_z = (gleason - np.nanmean(gleason)) / (np.nanstd(gleason) + 1e-8)
+
+    stage_map = {"I": 0.0, "II": 1.0, "III": 2.0, "IV": 3.0}
+    st = np.array([stage_map.get(str(s), 0.0) for s in stage], dtype=float)
+    st_z = (st - np.mean(st)) / (np.std(st) + 1e-8)
+
+    risk = gamma_age * age_z + gamma_stage * st_z + gamma_gleason * gl_z
+    # mild randomness so effect isn't perfectly deterministic
+    risk = risk + rng.normal(0.0, 0.05, size=risk.shape[0])
+
+    t = t / np.exp(risk)
+    t = np.clip(t, 1.0, None)
+    return t
+

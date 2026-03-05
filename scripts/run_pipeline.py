@@ -30,7 +30,13 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from prad_bn.simulate import SimConfig, simulate_prad_like_dataset, inject_survival_signal
+from prad_bn.simulate import (
+    SimConfig,
+    simulate_prad_like_dataset,
+    inject_survival_signal,
+    simulate_clinical_covariates,
+    apply_covariate_confounding_to_survival,
+)
 from prad_bn.discretize import survival_to_km_groups, maybe_supervised_bncuts
 from prad_bn.iterative import IterConfig, run_iterative_bn
 from prad_bn.evaluate import plot_km_by_group, plot_auc_over_iters, plot_sampling_probs
@@ -39,9 +45,107 @@ from prad_bn.moduleize import modules_from_blocks, module_eigengenes, discretize
 from prad_bn.causal_bn import rank_effects as rank_bn_effects
 from prad_bn.causal_ate import treatment_from_bins, estimate_ate_aipw
 from prad_bn.tcga import TcgaConfig, load_tcga_prad
+from prad_bn.clinical_gdc import ClinicalMap, load_gdc_covariates_aligned
 
 from pgmpy.models import DiscreteBayesianNetwork
 from pgmpy.estimators import BayesianEstimator
+
+
+def discretize_clinical_covariates(cov_df, names):
+    """Discretize age, stage, and gleason into small integer bins for a discrete BN.
+
+    Missing/unknown values are mapped to 0.
+    Returns (Z_disc, z_names_used).
+    """
+    import numpy as np
+    import pandas as pd
+
+    if cov_df is None or not names:
+        return None, []
+
+    df = cov_df if isinstance(cov_df, pd.DataFrame) else pd.DataFrame(cov_df, columns=names)
+
+    used = []
+    cols = []
+
+    # age: tertiles -> {1,2,3} (missing->0)
+    if "age" in df.columns:
+        s = pd.to_numeric(df["age"], errors="coerce")
+        b = pd.qcut(s, q=3, duplicates="drop").cat.codes  # -1 indicates NaN
+        b = b.astype(int)
+        miss = b == -1
+        b = b + 1
+        b[miss] = 0
+        cols.append(b.to_numpy())
+        used.append("age")
+
+    # stage: map I/II/III/IV -> {1,2,3,4} (unknown->0)
+    if "stage" in df.columns:
+        s = df["stage"].astype(str).str.upper()
+
+        def _stage_to_int(x: str) -> int:
+            if x.startswith("I") and not x.startswith("II") and not x.startswith("III") and not x.startswith("IV"):
+                return 1
+            if x.startswith("II") and not x.startswith("III") and not x.startswith("IV"):
+                return 2
+            if x.startswith("III") and not x.startswith("IV"):
+                return 3
+            if x.startswith("IV"):
+                return 4
+            return 0
+
+        b = s.map(_stage_to_int).fillna(0).astype(int)
+        cols.append(b.to_numpy())
+        used.append("stage")
+
+    # gleason: buckets (<=6, 7, >=8) -> {1,2,3} (missing->0)
+    if "gleason" in df.columns:
+        g = pd.to_numeric(df["gleason"], errors="coerce")
+        b = pd.cut(g, bins=[0, 6, 7, 10], labels=[1, 2, 3], include_lowest=True)
+        b = pd.Series(b).astype("float").fillna(0).astype(int)
+        cols.append(b.to_numpy())
+        used.append("gleason")
+
+    if not cols:
+        return None, []
+
+    return np.column_stack(cols).astype(int), used
+
+
+def covariates_to_numeric_for_ate(cov_df, names):
+    """Convert covariates into a numeric design matrix for ATE estimation."""
+    import pandas as pd
+    import numpy as np
+
+    if cov_df is None or not names:
+        return None, []
+
+    df = cov_df if isinstance(cov_df, pd.DataFrame) else pd.DataFrame(cov_df, columns=names)
+
+    mats = []
+    out_names = []
+
+    if "age" in df.columns:
+        s = pd.to_numeric(df["age"], errors="coerce")
+        mats.append(s.fillna(s.median()).to_numpy().reshape(-1, 1))
+        out_names.append("age")
+
+    if "gleason" in df.columns:
+        s = pd.to_numeric(df["gleason"], errors="coerce")
+        mats.append(s.fillna(s.median()).to_numpy().reshape(-1, 1))
+        out_names.append("gleason")
+
+    if "stage" in df.columns:
+        st = df["stage"].astype(str).fillna("NA")
+        d = pd.get_dummies(st, prefix="stage", dummy_na=False)
+        mats.append(d.to_numpy().astype(float))
+        out_names.extend(list(d.columns))
+
+    if not mats:
+        return None, []
+
+    Z = np.concatenate(mats, axis=1).astype(float)
+    return Z, out_names
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,11 +160,31 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--subset_size", type=int, default=20)
     ap.add_argument("--iters", type=int, default=25)
 
+    # Optional: user-provided GDC clinical file (TCGA mode) for age/stage/gleason covariates
+    ap.add_argument(
+        "--clinical_file",
+        type=str,
+        default=None,
+        help="(tcga mode) Optional GDC clinical TSV/CSV/ZIP used to extract age/stage/gleason and align to TCGA samples",
+    )
+    ap.add_argument("--clinical_id_col", type=str, default=None, help="Override ID column name in clinical file")
+    ap.add_argument("--clinical_age_col", type=str, default=None, help="Override age column name in clinical file")
+    ap.add_argument("--clinical_stage_col", type=str, default=None, help="Override stage column name in clinical file")
+    ap.add_argument("--clinical_gleason_col", type=str, default=None, help="Override gleason column name in clinical file")
+
     # Stabilized sampler knobs (leave defaults unless you want more/less exploration)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--epsilon", type=float, default=0.05)
     ap.add_argument("--p_min", type=float, default=1e-4)
     ap.add_argument("--ema_alpha", type=float, default=0.15)
+
+    # Optional: include available covariates as confounders in BN inference
+    ap.add_argument("--bn_covariates", action="store_true", help="Include covariates as parents of Outcome in the BN")
+    ap.add_argument("--bn_ess", type=int, default=5, help="BN equivalent sample size (BDeu smoothing)")
+
+    # Optional: simulate clinical covariates for synthetic runs
+    ap.add_argument("--sim_covariates", action="store_true", help="(sim mode) simulate age/stage/gleason")
+    ap.add_argument("--sim_confound_survival", action="store_true", help="(sim mode) if sim_covariates, make survival depend on covariates")
 
     # Synthetic realism knobs
     ap.add_argument("--inject_signal", action="store_true", help="Also inject monotonic signal after KM binning (legacy demo hook)")
@@ -93,6 +217,8 @@ def main() -> None:
     # 1) Load data
     covariates = None
     covariate_names = []
+    sample_ids = None
+
     if args.data == "sim":
         sim_cfg = SimConfig(
             n_samples=120,
@@ -110,14 +236,60 @@ def main() -> None:
         )
         sim = simulate_prad_like_dataset(sim_cfg, seed=args.seed)
         expr, time_days, event = sim["expr"], sim["time_days"], sim["event"]
+
+        if args.sim_covariates:
+            import pandas as pd
+            rng = np.random.default_rng(args.seed)
+            cov = simulate_clinical_covariates(expr.shape[0], rng)
+            covariates = pd.DataFrame(cov)
+            covariate_names = list(covariates.columns)
+            if args.sim_confound_survival:
+                time_days = apply_covariate_confounding_to_survival(time_days, cov, rng)
+
     else:
         tcfg = TcgaConfig(cache_dir=args.tcga_cache, n_genes=args.n_genes, endpoint=args.endpoint, random_seed=args.seed)
         tcga = load_tcga_prad(tcfg)
         expr, time_days, event = tcga["expr"], tcga["time_days"], tcga["event"]
         covariates = tcga.get("covariates", None)
         covariate_names = tcga.get("covariate_names", [])
+        sample_ids = tcga.get("sample_ids", None)
+
+        # ---- FIX #1: Ensure expr is samples x genes (not genes x samples) ----
+        # We expect len(time_days) == n_samples
+        n_surv = len(time_days)
+        if expr.shape[0] != n_surv and expr.shape[1] == n_surv:
+            # Looks like genes x samples -> transpose
+            expr = expr.T
+
+        # Prefer covariates from user-provided GDC clinical file (Xena phenotype often lacks stage/gleason)
+        if args.clinical_file:
+            if sample_ids is None:
+                raise RuntimeError("TCGA loader did not return sample_ids; cannot align clinical covariates")
+
+            cov_np, cov_names, msg = load_gdc_covariates_aligned(
+                clinical_file=args.clinical_file,
+                sample_ids=np.asarray(sample_ids),
+                mapping=ClinicalMap(
+                    id_col=args.clinical_id_col,
+                    age_col=args.clinical_age_col,
+                    stage_col=args.clinical_stage_col,
+                    gleason_col=args.clinical_gleason_col,
+                ),
+            )
+            print("[clinical]", msg)
+            if cov_np is not None and cov_names:
+                covariates = cov_np
+                covariate_names = cov_names
+
         # TCGA expression can be large; clip extreme tails for discretization stability
         expr = np.clip(expr, np.nanpercentile(expr, 0.5), np.nanpercentile(expr, 99.5))
+
+        # Final sanity: expr rows must match survival vectors
+        if expr.shape[0] != len(time_days) or expr.shape[0] != len(event):
+            raise RuntimeError(
+                f"Alignment error: expr has {expr.shape[0]} rows but time_days has {len(time_days)} and event has {len(event)}. "
+                "Expression must be samples x genes."
+            )
 
     # 2) Discretize survival into 5 KM-like groups (quantile bins)
     km_group = survival_to_km_groups(time_days, q=5)
@@ -140,8 +312,14 @@ def main() -> None:
         epsilon=args.epsilon,
         p_min=args.p_min,
         ema_alpha=args.ema_alpha,
+        equivalent_sample_size=args.bn_ess,
     )
-    result = run_iterative_bn(X_disc, km_group, iter_cfg, seed=args.seed)
+
+    Z_disc, z_used = (None, [])
+    if args.bn_covariates and covariates is not None and covariate_names:
+        Z_disc, z_used = discretize_clinical_covariates(covariates, covariate_names)
+
+    result = run_iterative_bn(X_disc, km_group, iter_cfg, seed=args.seed, Z_disc=Z_disc, z_names=z_used)
 
     # 5) Write artifacts
     np.savetxt(f"{args.outdir}/km_group.csv", km_group, delimiter=",", fmt="%d")
@@ -160,7 +338,8 @@ def main() -> None:
         "best_auc": float(result.best_auc),
         "best_features": list(map(int, result.best_features)),
         "sampler": {"temperature": args.temperature, "epsilon": args.epsilon, "p_min": args.p_min, "ema_alpha": args.ema_alpha},
-        "covariates": covariate_names,
+        "covariates_available": covariate_names,
+        "bn_used_covariates": bool(args.bn_covariates and covariates is not None and covariate_names),
     }
     with open(f"{args.outdir}/run_metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -194,23 +373,33 @@ def main() -> None:
         module_names = [s.name for s in specs]
 
         worst = int(np.max(km_group))
-        Y = (km_group == worst).astype(int)
+        Y_all = (km_group == worst).astype(int)
+
+        Z_all, Z_names = covariates_to_numeric_for_ate(covariates, covariate_names)
 
         results = []
         for j, name in enumerate(module_names):
-            T = treatment_from_bins(M_disc[:, j], low=0, high=args.module_bins-1)
-            keep = T != -1
+            T_all = treatment_from_bins(M_disc[:, j], low=0, high=args.module_bins - 1)
+
+            keep = (T_all != -1)
             if keep.sum() < 40:
                 continue
-            Z = covariates[keep] if covariates is not None else None
-            res = estimate_ate_aipw(T[keep], Y[keep], Z=Z, seed=args.seed)
-            results.append({"module": name, "ate": res.ate, "se": res.se, "n": res.n, "method": res.method, "placebo_ate": res.placebo_ate})
+
+            # ---- FIX #2: mask ONCE, consistently ----
+            T = T_all[keep]
+            Y = Y_all[keep]
+            Z_keep = (Z_all[keep] if Z_all is not None else None)
+
+            res = estimate_ate_aipw(T, Y, Z=Z_keep, seed=args.seed)
+            results.append(
+                {"module": name, "ate": res.ate, "se": res.se, "n": res.n, "method": res.method, "placebo_ate": res.placebo_ate}
+            )
 
         results.sort(key=lambda r: abs(r["ate"]), reverse=True)
         out = {
             "note": "DoWhy-style ATE: treatment=module-high vs module-low; outcome=worst KM risk indicator; adjusted by available covariates (if any).",
             "endpoint": args.endpoint if args.data == "tcga" else "simulated",
-            "covariates": covariate_names,
+            "covariates": Z_names,
             "results_top": results[:10],
             "n_modules_tested": len(results),
         }
@@ -219,8 +408,14 @@ def main() -> None:
 
     print("\n=== PRAD BN Survival Pipeline ===")
     print(f"Data: {args.data} | Samples: {expr.shape[0]} | Genes: {expr.shape[1]}")
+    if covariate_names:
+        print(f"Covariates available: {', '.join(covariate_names)}")
+    else:
+        print("Covariates available: (none)")
     if args.data == "tcga":
-        print(f"Endpoint: {args.endpoint} | Covariates used for ATE: {', '.join(covariate_names) if covariate_names else '(none found)'}")
+        print(f"Endpoint: {args.endpoint}")
+    if args.bn_covariates:
+        print(f"BN covariates enabled: {'yes' if (covariates is not None and covariate_names) else 'requested but none available'}")
     print(f"Best AUC (worst-group vs rest): {result.best_auc:.3f}")
     print(f"Artifacts written to: {args.outdir}\n")
 

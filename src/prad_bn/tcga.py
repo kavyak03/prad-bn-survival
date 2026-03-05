@@ -185,25 +185,54 @@ def _read_tsv_gz(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, sep="\t", compression="gzip", low_memory=False)
 
 def _prad_samples_from_pheno(pheno: pd.DataFrame, tumor: str) -> pd.DataFrame:
-    # Xena phenotype uses sample IDs like TCGA-XX-YYYY-01A... ; primary tumors have -01A
-    if "sample" in pheno.columns:
-        idx = pheno["sample"].astype(str)
-    else:
-        # first column is sample id in some variants
-        idx = pheno.iloc[:, 0].astype(str)
+    """
+    Robustly subset Xena phenotype table to PRAD samples.
+
+    Handles multiple phenotype formats:
+    - classic pancan phenotype tables
+    - minimal phenotype tables containing `_primary_disease`
+    """
+
+    pheno = pheno.copy()
+
+    # Ensure sample column exists
+    if "sample" not in pheno.columns:
         pheno = pheno.rename(columns={pheno.columns[0]: "sample"})
+
     pheno["sample"] = pheno["sample"].astype(str)
 
-    # Prefer cancer type column names that exist
-    tumor_cols = [c for c in pheno.columns if c.lower() in {"cancer", "study", "_study", "cohort"}]
-    if tumor_cols:
-        col = tumor_cols[0]
-        mask = pheno[col].astype(str).str.contains("PRAD", na=False)
-    else:
-        # fallback: infer by TCGA barcode prefix only; keep all then filter later by expression intersection
-        mask = pheno["sample"].str.startswith("TCGA-", na=False)
-    prad = pheno.loc[mask].copy()
-    return prad
+    # --- 1. Preferred: use _primary_disease column ---
+    if "_primary_disease" in pheno.columns:
+        disease = pheno["_primary_disease"].astype(str).str.upper()
+        mask = disease.str.contains("PROSTATE", na=False) | disease.str.contains("PRAD", na=False)
+
+        prad = pheno.loc[mask].copy()
+
+        if len(prad) < 100:
+            raise RuntimeError(
+                "PRAD filtering using `_primary_disease` returned too few samples."
+            )
+
+        return prad
+
+    # --- 2. Try generic cohort/cancer columns ---
+    cand_cols = []
+    for c in pheno.columns:
+        cl = c.lower()
+        if any(k in cl for k in ["cancer", "cohort", "study", "project", "disease", "tumor"]):
+            cand_cols.append(c)
+
+    for c in cand_cols:
+        s = pheno[c].astype(str).str.upper()
+        mask = s.str.contains("PRAD", na=False) | s.str.contains("PROSTATE", na=False)
+
+        if mask.sum() > 100:
+            return pheno.loc[mask].copy()
+
+    raise RuntimeError(
+        "Could not identify PRAD samples in phenotype table. "
+        f"Available columns: {list(pheno.columns)}"
+    )
 
 def _pick_endpoint(pheno: pd.DataFrame, endpoint: str) -> Tuple[np.ndarray, np.ndarray]:
     endpoint = endpoint.upper().strip()

@@ -1,218 +1,284 @@
-# PRAD Adaptive Bayesian Network Survival + Causal Extensions
+# PRAD-BN-Survival
 
-This repo is an implementation of a high‑p / low‑n survival modeling pipeline inspired by TCGA‑PRAD:
+**Bayesian Network--Based Causal Survival Modeling in Prostate Cancer**
 
-- **Synthetic PRAD-like simulator (default)**: right‑skewed RNA‑seq‑like expression, **block‑correlated modules**, long‑tailed **censored** survival
-- **Survival outcome engineering**: discretize survival time into **5 Kaplan–Meier-style risk strata** (quantile bins)
-- **Bayesian Network modeling**: discretize expression into bins and fit compact BN models
-- **Adaptive feature sampling loop**: iteratively sample small gene subsets and update sampling probabilities using AUC feedback
-- **Causal / explainability add‑ons**:
-  - **Model-based do-interventions** inside the learned BN (gene-level sensitivity)
-  - **Module-level doWhy-style ATE** with (optional) clinical adjustment (TCGA mode)
+A reproducible pipeline for discovering gene modules associated with
+prostate cancer survival using **Bayesian networks, causal inference,
+and TCGA PRAD transcriptomics**.
 
-> **Why the synthetic-first design?**  
-> It keeps the repo runnable anywhere and lets you explain the method clearly.  
-> Real TCGA runs are supported as an optional mode and are expected to have **modest** results (which is realistic and credible).
+The repository demonstrates how **structure learning + causal
+inference** can identify survival-associated gene modules while
+adjusting for **clinical confounders (age, tumor stage, Gleason
+score)**.
 
----
+The project supports both:
 
+-   **Synthetic simulations** for validating causal inference behavior
+-   **Real TCGA PRAD analysis** using transcriptomics and GDC clinical
+    data
 
-## Architecture at a glance (3 layers)
+------------------------------------------------------------------------
 
-> **Layer 1 (Core):** discretized survival → iterative BN learning → adaptive feature sampling  
-> **Layer 2 (Model-based “what-if”):** BN do-interventions (graph mutilation + deterministic CPDs)  
-> **Layer 3 (doWhy-style causal validation):** module-level ATE with clinical adjustment + refutation
+# Project Motivation
 
-```text
-                 ┌───────────────────────────────────────────────────────┐
-                 │                    Data Sources                        │
-                 │  (A) Synthetic PRAD-like   (B) TCGA PRAD via Xena       │
-                 └───────────────┬───────────────────────────┬───────────┘
-                                 │                           │
-                                 v                           v
-                    ┌──────────────────────┐     ┌──────────────────────┐
-                    │  Preprocess / Align  │     │  Preprocess / Align  │
-                    │  - expr matrix X     │     │  - expr + survival     │
-                    │  - time/event        │     │  - clinical covariates │
-                    └───────────┬──────────┘     └───────────┬──────────┘
-                                \____________________________/
-                                              │
-                                              v
-                         ┌────────────────────────────────────────┐
-                         │      Outcome Engineering (Layer 1)      │
-                         │  survival → Kaplan–Meier risk groups     │
-                         └──────────────────────┬─────────────────┘
-                                                │
-                                                v
-                         ┌────────────────────────────────────────┐
-                         │      Discretize Expression (Layer 1)    │
-                         │   genes/modules → bins (small-n ready)  │
-                         └──────────────────────┬─────────────────┘
-                                                │
-                                                v
-                  ┌────────────────────────────────────────────────────────┐
-                  │     Iterative BN + Adaptive Feature Sampling (Layer 1) │
-                  │  sample subset → fit constrained BN → AUC → update p   │
-                  └──────────────────────┬─────────────────────────────────┘
-                                         │
-                ┌────────────────────────┼────────────────────────┐
-                │                        │                        │
-                v                        v                        v
-┌───────────────────────────┐  ┌───────────────────────────┐  ┌───────────────────────────┐
-│ Outputs (Layer 1)         │  │ BN do-interventions        │  │ Module ATE (doWhy-style)   │
-│ - KM curves               │  │ (Layer 2, optional)         │  │ (Layer 3, optional)        │
-│ - AUC over iterations     │  │ - P(Y|do(gene/bin))         │  │ - Treatment: module high/low│
-│ - sampling probabilities  │  │ - Δ P(worst-risk) rankings  │  │ - Adjust for clinical Z     │
-└───────────────────────────┘  └───────────────────────────┘  │ - AIPW ATE + placebo test   │
-                                                               └───────────────────────────┘
-```
+Gene expression signatures are often correlated with survival but may be
+**confounded by clinical variables** such as tumor stage or patient age.
 
-## Requirements
+This repository explores two complementary causal inference strategies:
 
-- **Python ≥ 3.10** (pgmpy uses modern typing)
-- Recommended: create an isolated virtual environment.
+1.  **Doubly Robust ATE estimation**
+2.  **Bayesian Network do-interventions**
 
-Install:
+to identify gene modules that may **causally influence patient
+survival**.
 
-```bash
-py -3.11 -m venv .venv
-# Windows:
-.\.venv\Scripts\activate
-# macOS/Linux:
+------------------------------------------------------------------------
+
+# High Level Pipeline
+
+Gene Expression Data\
+↓\
+Gene Subset Sampling\
+↓\
+Discretization\
+↓\
+Bayesian Network Structure Learning\
+↓\
+Outcome Prediction / Survival Grouping
+
+Branches: - Module Causal Effect (ATE) - BN Intervention Analysis
+
+------------------------------------------------------------------------
+
+# Bayesian Network Intuition
+
+Typical causal structure:
+
+Age ─┐\
+Stage ─┼──► Survival\
+Gleason ┘
+
+Gene_1 ──►\
+Gene_2 ──► Survival\
+Gene_3 ──►
+
+Causal inference estimates:
+
+P(Survival \| do(Gene_i = high))
+
+instead of the observational:
+
+P(Survival \| Gene_i = high)
+
+------------------------------------------------------------------------
+
+# Causal Inference Modes
+
+  -----------------------------------------------------------------------
+  Mode                    Flag                    Description
+  ----------------------- ----------------------- -----------------------
+  Baseline survival       *(default)*             BN structure search +
+  grouping                                        Kaplan--Meier grouping
+
+  Module causal inference `--module_causal`       Doubly robust ATE
+                                                  estimation for gene
+                                                  modules
+
+  Bayesian network        `--causal_bn`           Estimate causal effects
+  interventions                                   using BN
+                                                  do-interventions
+  -----------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+# Optional Covariates
+
+Covariates can be incorporated into the pipeline.
+
+### Available Covariates
+
+From GDC clinical data:
+
+-   Age at diagnosis\
+-   Tumor stage\
+-   Gleason score
+
+Enable covariate adjustment in the BN with:
+
+--bn_covariates
+
+------------------------------------------------------------------------
+
+# Synthetic Data Experiments
+
+The simulation framework allows controlled causal experiments.
+
+### Simulated Covariates
+
+--sim_covariates
+
+Adds simulated:
+
+-   Age\
+-   Stage\
+-   Gleason
+
+### Simulated Confounding
+
+--sim_confound_survival
+
+Creates ground truth:
+
+Covariates → Survival\
+Gene Modules → Survival
+
+This allows testing whether causal inference methods recover unbiased
+gene effects.
+
+------------------------------------------------------------------------
+
+# Installation
+
+Clone the repository.
+
+git clone https://github.com/YOUR_USERNAME/prad-bn-survival.git\
+cd prad-bn-survival
+
+Create a virtual environment.
+
+Windows:
+
+py -m venv .venv\
+.venv`\Scripts`{=tex}`\activate`{=tex}
+
+Linux / Mac:
+
+python3 -m venv .venv\
 source .venv/bin/activate
 
+Install dependencies.
+
 pip install -r requirements.txt
-```
 
----
+------------------------------------------------------------------------
 
-## Quickstart (Synthetic Demo)
+# Example Runs
 
-Run the default synthetic demo:
+## 1. Synthetic Demo
 
-```bash
 python -m scripts.run_pipeline --outdir runs/demo --seed 7
-```
 
-This writes:
-- `auc_over_iters.png` — AUC improving over iterations
-- `top_sampling_probs.png` — stabilized top‑20 sampling probabilities (no “one gene = 1.0” collapse)
-- `km_curves_by_group.png` — KM curves by risk stratum
-- `best_edges.txt`, `run_metadata.json`
+------------------------------------------------------------------------
 
-Run pipeline fill usage:
-run_pipeline.py [-h] [--outdir OUTDIR] [--seed SEED] [--data {sim,tcga}] [--endpoint {PFI,OS}] [--n_genes N_GENES]
-                       [--subset_size SUBSET_SIZE] [--iters ITERS] [--temperature TEMPERATURE] [--epsilon EPSILON]
-                       [--p_min P_MIN] [--ema_alpha EMA_ALPHA] [--inject_signal] [--causal_bn] [--module_causal]
-                       [--n_blocks N_BLOCKS] [--module_bins MODULE_BINS] [--tcga_cache TCGA_CACHE]
+## 2. Synthetic + Covariates
 
-### How does the sampling probability loop run
+python -m scripts.run_pipeline\
+--sim_covariates\
+--sim_confound_survival\
+--outdir runs/demo_cov
 
-The adaptive sampler is **stabilized** to prevent premature collapse:
-- score updates in logit/score space + **softmax temperature**
-- **EMA smoothing**
-- **epsilon-greedy** exploration
-- probability floor `p_min`
+------------------------------------------------------------------------
 
-You can tune these knobs:
+## 3. TCGA PRAD Survival Analysis
 
-```bash
-python -m scripts.run_pipeline --temperature 1.2 --epsilon 0.08 --ema_alpha 0.12 --p_min 1e-4
-```
+python -m scripts.run_pipeline\
+--data tcga\
+--endpoint PFI\
+--n_genes 8000\
+--tcga_cache data/tcga\
+--outdir runs/tcga
+--seed 7\
+--iters 60\
+--subset_size 30\
 
----
+------------------------------------------------------------------------
 
-## TCGA Mode (End-to-End on Real PRAD)
+## 4. TCGA + Clinical Covariates + causal inference
 
-This mode downloads public data from **UCSC Xena** and runs the same pipeline.
+Download the TCGA PRAD clinical file from GDC.
 
-```bash
-python -m scripts.run_pipeline \
-  --data tcga \
-  --endpoint PFI \
-  --n_genes 2000 \
-  --tcga_cache data/tcga \
-  --outdir runs/tcga_pfi \
-  --seed 7
-```c
+python -m scripts.run_pipeline\
+--data tcga\
+--endpoint PFI\
+--clinical_file data/tcga/clinical.zip\
+--bn_covariates\
+--module_causal\
+--n_genes 8000\
+--tcga_cache data/tcga\
+--seed 7\
+--iters 60\
+--subset_size 30\
+--outdir runs/tcga_clinical
 
-Notes:
-- TCGA runs are slower.
-- PRAD survival endpoints can be noisy; **modest AUC is normal**.
-- We subset to the **top-variable genes** to keep it runnable.
+------------------------------------------------------------------------
 
----
+## 5. Full Causal Analysis with bayesian network interventions
 
-## Causal / Explainability Extensions
+python -m scripts.run_pipeline\
+--data tcga\
+--endpoint PFI\
+--clinical_file data/tcga/clinical.zip\
+--bn_covariates\
+--module_causal\
+--causal_bn\
+--n_genes 8000\
+--tcga_cache data/tcga\
+--seed 7\
+--iters 60\
+--subset_size 30\
+--outdir runs/tcga_causal
 
-### 1) Gene-level do-intervention (model-based BN sensitivity)
+This performs:
 
-Runs **do-operator interventions inside the learned BN**:
+1.  BN structure learning\
+2.  Module-level causal ATE estimation\
+3.  Bayesian network intervention analysis
 
-```bash
-python -m scripts.run_pipeline --outdir runs/demo_causal --seed 7 --causal_bn
-```
+------------------------------------------------------------------------
 
-Output:
-- `causal_bn_effects.json` (top genes ranked by Δ P(worst risk) under do-intervention)
+# Output Files
 
-**Important caveat:**  
-On TCGA this should be described as *model-based sensitivity / what-if analysis* unless you add a full causal identification strategy.
+Results are written to the runs/ directory.
 
----
+Typical outputs:
 
-### 2) Module-level doWhy-style ATE (recommended “causal story” for TCGA)
+runs/\
+├── best_gene_sets.csv\
+├── survival_groups.csv\
+├── causal_module_effects.csv\
+├── bn_structure.json\
+└── plots/
 
-This is the most relevant “SCM-ish” extension for your use case:
-- build **module eigengenes** from correlated blocks
-- define treatment as **module-high vs module-low** (drop mid bin)
-- define outcome as **worst KM risk vs rest**
-- estimate **ATE** using **AIPW (doubly robust)** with clinical adjustment if covariates are available
-- run a simple **placebo refuter** (shuffle treatment)
+------------------------------------------------------------------------
 
-Run on TCGA:
+# Repository Structure
 
-```bash
-python -m scripts.run_pipeline \
-  --data tcga \
-  --endpoint PFI \
-  --n_genes 2000 \
-  --module_causal \
-  --n_blocks 8 \
-  --module_bins 3 \
-  --outdir runs/tcga_pfi_ate \
-  --seed 7
-```
+scripts/\
+run_pipeline.py
 
-Output:
-- `module_ate_results.json` containing:
-  - covariates actually found/used (age/gleason/stage if present)
-  - top modules by |ATE|
-  - placebo ATE (should be near 0 if the estimate is not spurious)
+src/prad_bn/\
+tcga.py\
+clinical_gdc.py\
+iterative.py\
+causal_effects.py
 
-**How to describe this in interviews (accurate + strong):**
-- “I implemented a doWhy-style ATE pipeline at the module level with backdoor adjustment on available clinical covariates (when present).”
-- “This gives an interpretable ‘pathway shift’ effect on risk, and it’s more stable than gene-level effects.”
+docs/\
+bn_structure.png
 
----
+------------------------------------------------------------------------
 
-## What changed vs the original version
+# Scientific Contributions
 
-1) **More realistic synthetic survival**: survival can be driven by *distributed pathway-like signal* (modules), avoiding “one magic gene”
-2) **Stabilized adaptive sampler**: prevents probability collapse; improves run-to-run behavior
-3) **TCGA mode via Xena**: optional end-to-end real PRAD run
-4) **Causal extensions**:
-   - BN do-intervention sensitivity
-   - module-level doWhy-style ATE (AIPW + placebo refuter)
+• Bayesian network structure learning on transcriptomics\
+• Doubly robust causal effect estimation\
+• Integration of clinical confounders from GDC\
+• Simulation framework for causal validation
 
----
+------------------------------------------------------------------------
 
-## Repo layout
+# Future Improvements
 
-- `src/prad_bn/simulate.py` — realistic PRAD-like simulator
-- `src/prad_bn/iterative.py` — adaptive BN loop (stabilized sampler)
-- `src/prad_bn/tcga.py` — TCGA PRAD loader (UCSC Xena)
-- `src/prad_bn/causal_bn.py` — do-intervention inside BN (sensitivity)
-- `src/prad_bn/causal_ate.py` — doWhy-style ATE (AIPW + placebo)
-- `src/prad_bn/moduleize.py` — modules/eigengenes for module-level causal modeling
-- `scripts/run_pipeline.py` — CLI entry point (sim + tcga + causal)
+-   Graph neural networks for pathway discovery\
+-   Time-to-event causal modeling\
+-   Multi-omics integration\
+-   Automatic DAG visualization
