@@ -1,12 +1,12 @@
-# PRAD-BN-Survival
+# BioGraphX
+
+BioGraphX is a modular probabilitistic discovery framework for discovering biologically meaningful gene signals from high-dimensional omics data using iterative Bayesian network modeling and causal inference. It supports both simulated and real-world transcriptomic workflows, identifies feature subsets associated with outcome risk, and extends those discoveries into module-level causal effect estimation with clinical covariate adjustment. The framework is designed to be reusable across disease areas and phenotypes, not just a single cancer use case. It combines interpretable probabilistic modeling, robust data engineering, and biologically grounded feature discovery in one end-to-end pipeline.
 
 **Bayesian Network--Based Causal Survival Modeling in Prostate Cancer**
 
-A reproducible pipeline for discovering gene modules associated with
+This repo showcases a reproducible pipeline for discovering gene modules associated with
 prostate cancer survival using **Bayesian networks, causal inference,
-and TCGA PRAD transcriptomics**.
-
-This repository demonstrates how **structure learning + causal
+and TCGA PRAD transcriptomics** through BioGraphX. It demonstrates how **structure learning + causal
 inference** can identify survival-associated gene modules while
 adjusting for **clinical confounders (age, tumor stage, Gleason
 score)**.
