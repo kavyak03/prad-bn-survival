@@ -39,7 +39,13 @@ from prad_bn.simulate import (
 )
 from prad_bn.discretize import survival_to_km_groups, maybe_supervised_bncuts
 from prad_bn.iterative import IterConfig, run_iterative_bn
-from prad_bn.evaluate import plot_km_by_group, plot_auc_over_iters, plot_sampling_probs
+from prad_bn.evaluate import (
+    plot_km_by_group,
+    plot_auc_over_iters,
+    plot_sampling_probs,
+    plot_right_skewed_expression, # NEW
+    plot_block_correlated_modules, # NEW
+)
 
 from prad_bn.moduleize import modules_from_blocks, module_eigengenes, discretize_modules
 from prad_bn.causal_bn import rank_effects as rank_bn_effects
@@ -71,7 +77,7 @@ def discretize_clinical_covariates(cov_df, names):
     # age: tertiles -> {1,2,3} (missing->0)
     if "age" in df.columns:
         s = pd.to_numeric(df["age"], errors="coerce")
-        b = pd.qcut(s, q=3, duplicates="drop").cat.codes  # -1 indicates NaN
+        b = pd.qcut(s, q=3, duplicates="drop").cat.codes # -1 indicates NaN
         b = b.astype(int)
         miss = b == -1
         b = b + 1
@@ -195,6 +201,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--n_blocks", type=int, default=8, help="Number of modules (blocks) for module analysis")
     ap.add_argument("--module_bins", type=int, default=3, help="Discretization bins for modules")
     ap.add_argument("--tcga_cache", type=str, default="data/tcga", help="Cache dir for TCGA downloads (tcga mode)")
+
+    # NEW: plotting knob (don’t correlate all 8000 genes!)
+    ap.add_argument("--qc_corr_genes", type=int, default=350, help="(tcga mode) genes used for correlation QC plot")
+
     return ap.parse_args()
 
 
@@ -217,8 +227,6 @@ def main() -> None:
     # 1) Load data
     covariates = None
     covariate_names = []
-    sample_ids = None
-
     if args.data == "sim":
         sim_cfg = SimConfig(
             n_samples=120,
@@ -239,30 +247,23 @@ def main() -> None:
 
         if args.sim_covariates:
             import pandas as pd
+
             rng = np.random.default_rng(args.seed)
             cov = simulate_clinical_covariates(expr.shape[0], rng)
             covariates = pd.DataFrame(cov)
             covariate_names = list(covariates.columns)
             if args.sim_confound_survival:
                 time_days = apply_covariate_confounding_to_survival(time_days, cov, rng)
-
     else:
         tcfg = TcgaConfig(cache_dir=args.tcga_cache, n_genes=args.n_genes, endpoint=args.endpoint, random_seed=args.seed)
         tcga = load_tcga_prad(tcfg)
         expr, time_days, event = tcga["expr"], tcga["time_days"], tcga["event"]
         covariates = tcga.get("covariates", None)
         covariate_names = tcga.get("covariate_names", [])
-        sample_ids = tcga.get("sample_ids", None)
-
-        # ---- FIX #1: Ensure expr is samples x genes (not genes x samples) ----
-        # We expect len(time_days) == n_samples
-        n_surv = len(time_days)
-        if expr.shape[0] != n_surv and expr.shape[1] == n_surv:
-            # Looks like genes x samples -> transpose
-            expr = expr.T
 
         # Prefer covariates from user-provided GDC clinical file (Xena phenotype often lacks stage/gleason)
         if args.clinical_file:
+            sample_ids = tcga.get("sample_ids")
             if sample_ids is None:
                 raise RuntimeError("TCGA loader did not return sample_ids; cannot align clinical covariates")
 
@@ -284,12 +285,13 @@ def main() -> None:
         # TCGA expression can be large; clip extreme tails for discretization stability
         expr = np.clip(expr, np.nanpercentile(expr, 0.5), np.nanpercentile(expr, 99.5))
 
-        # Final sanity: expr rows must match survival vectors
-        if expr.shape[0] != len(time_days) or expr.shape[0] != len(event):
-            raise RuntimeError(
-                f"Alignment error: expr has {expr.shape[0]} rows but time_days has {len(time_days)} and event has {len(event)}. "
-                "Expression must be samples x genes."
-            )
+        # NEW: TCGA QC plots saved under outdir
+        try:
+            plot_right_skewed_expression(expr, f"{args.outdir}/tcga_expr_right_skew.png", seed=args.seed)
+            plot_block_correlated_modules(expr, f"{args.outdir}/tcga_expr_block_corr.png", n_genes=args.qc_corr_genes, seed=args.seed)
+        except Exception as e:
+            with open(f"{args.outdir}/tcga_qc_plot_error.txt", "w") as f:
+                f.write(str(e))
 
     # 2) Discretize survival into 5 KM-like groups (quantile bins)
     km_group = survival_to_km_groups(time_days, q=5)
@@ -297,7 +299,7 @@ def main() -> None:
     # Optional legacy hook: inject monotonic signal AFTER KM binning (kept for continuity)
     if args.data == "sim" and args.inject_signal:
         rng = np.random.default_rng(args.seed)
-        sim_cfg = SimConfig(n_genes=expr.shape[1])  # minimal
+        sim_cfg = SimConfig(n_genes=expr.shape[1]) # minimal
         expr, _ = inject_survival_signal(expr, km_group, sim_cfg, rng)
 
     # 3) Discretize gene expression into bins suitable for BN
@@ -373,27 +375,24 @@ def main() -> None:
         module_names = [s.name for s in specs]
 
         worst = int(np.max(km_group))
-        Y_all = (km_group == worst).astype(int)
+        Y = (km_group == worst).astype(int)
 
         Z_all, Z_names = covariates_to_numeric_for_ate(covariates, covariate_names)
 
         results = []
         for j, name in enumerate(module_names):
-            T_all = treatment_from_bins(M_disc[:, j], low=0, high=args.module_bins - 1)
-
-            keep = (T_all != -1)
+            T = treatment_from_bins(M_disc[:, j], low=0, high=args.module_bins - 1)
+            keep = T != -1
             if keep.sum() < 40:
                 continue
 
-            # ---- FIX #2: mask ONCE, consistently ----
-            T = T_all[keep]
-            Y = Y_all[keep]
-            Z_keep = (Z_all[keep] if Z_all is not None else None)
+            # FIX: only subset once (do NOT apply keep twice)
+            Z_keep = None
+            if Z_all is not None:
+                Z_keep = Z_all[keep]
 
-            res = estimate_ate_aipw(T, Y, Z=Z_keep, seed=args.seed)
-            results.append(
-                {"module": name, "ate": res.ate, "se": res.se, "n": res.n, "method": res.method, "placebo_ate": res.placebo_ate}
-            )
+            res = estimate_ate_aipw(T[keep], Y[keep], Z=Z_keep, seed=args.seed)
+            results.append({"module": name, "ate": res.ate, "se": res.se, "n": res.n, "method": res.method, "placebo_ate": res.placebo_ate})
 
         results.sort(key=lambda r: abs(r["ate"]), reverse=True)
         out = {

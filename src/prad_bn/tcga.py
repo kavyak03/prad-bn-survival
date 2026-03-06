@@ -380,12 +380,28 @@ def load_tcga_prad(cfg: TcgaConfig) -> Dict[str, object]:
     time_days = time_days[mask]
     event = event[mask]
 
-    # --- Choose top variable genes within PRAD ---
+    # --- Convert to matrix ---
     X = expr_prad.to_numpy(dtype=np.float32)
-    vars_ = np.nanvar(X, axis=0)
-    top = np.argsort(vars_)[::-1][: cfg.n_genes]
+    gene_names_all = expr_prad.columns.to_numpy()
+
+    # --- Filter unusable genes ---
+    # keep genes that have at least one finite value
+    has_signal = np.isfinite(X).any(axis=0)
+
+    # remove genes with zero or undefined variance
+    vars_all = np.nanvar(X, axis=0)
+    has_variance = np.isfinite(vars_all) & (vars_all > 0)
+
+    valid = has_signal & has_variance
+
+    X = X[:, valid]
+    gene_names_all = gene_names_all[valid]
+    vars_all = vars_all[valid]
+
+    # --- Choose top variable genes within PRAD ---
+    top = np.argsort(vars_all)[::-1][: cfg.n_genes]
     X = X[:, top]
-    gene_names = expr_prad.columns.to_numpy()[top]
+    gene_names = gene_names_all[top]
 
     # --- Covariates (from phenotype-aligned table) ---
     Z = _extract_covariates(prad_aligned.reset_index())

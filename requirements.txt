@@ -6,3 +6,4 @@ networkx>=3.1
 pgmpy>=0.1.26
 requests
 tqdm
+lifelines
